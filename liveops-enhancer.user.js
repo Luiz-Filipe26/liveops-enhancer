@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Seidor LiveOps - Melhorias na tabela
 // @namespace    custom.liveops
-// @version      1.0
+// @version      1.1
 // @description  Melhora layout, rolagem, foco, ordenação, reorganização de colunas e exportação da tabela de chamados
 // @match        https://liveops-americas.seidor.com/*
 // @updateURL    https://raw.githubusercontent.com/Luiz-Filipe26/liveops-enhancer/main/liveops-enhancer.user.js
 // @downloadURL  https://raw.githubusercontent.com/Luiz-Filipe26/liveops-enhancer/main/liveops-enhancer.user.js
+// @run-at       document-end
 // @grant        none
 // ==/UserScript==
 
@@ -19,6 +20,8 @@
      */
 
     const TABLE_SELECTOR = '#grid';
+
+    const TICKET_URL_COLUMN = 'ticketUrl';
 
     const STORAGE_KEY = 'liveops-enhancer-preferences';
 
@@ -45,6 +48,89 @@
 
     /*
      * ============================================================
+     * Acesso à aplicação Angular e aos dados atuais da tabela
+     * ============================================================
+     */
+
+    const APPLICATION_CAPTURE_TIMEOUT_MS = 15000;
+    let applicationPromise = null;
+
+    function getAngularApplication() {
+        if (applicationPromise) return applicationPromise;
+
+        const prototype = window.ng?.coreTokens?.ApplicationRef?.prototype;
+        if (typeof prototype?.tick !== 'function') {
+            return Promise.reject(new Error('O acesso à aplicação Angular não está disponível.'));
+        }
+
+        const originalTick = prototype.tick;
+        const capture = new Promise((resolve, reject) => {
+            const restore = () => {
+                if (prototype.tick === captureTick) prototype.tick = originalTick;
+                clearTimeout(timer);
+            };
+            function captureTick() {
+                // Capture apenas a referência; deixe o ciclo natural terminar normalmente.
+                restore();
+                try {
+                    return originalTick.apply(this, arguments);
+                } finally {
+                    resolve(this);
+                }
+            }
+            const timer = setTimeout(() => {
+                restore();
+                reject(new Error('Não foi possível acessar a aplicação Angular: nenhum ciclo foi observado em 15 segundos.'));
+            }, APPLICATION_CAPTURE_TIMEOUT_MS);
+            prototype.tick = captureTick;
+        });
+
+        applicationPromise = capture.catch(error => {
+            applicationPromise = null;
+            throw error;
+        });
+        return applicationPromise;
+    }
+
+    function getTicketIdsForGrid(gridElement, rootViews) {
+        if (!gridElement) {
+            throw new Error('O componente da tabela não foi encontrado.');
+        }
+
+        // Angular 7 View Engine: localize a instância pela identidade do seu host DOM.
+        // Não retenha o componente: pesquisas e navegação podem recriar suas views.
+        const views = rootViews.map(reference => reference._view);
+        const seen = new Set();
+        for (const view of views) {
+            if (!view || seen.has(view)) continue;
+            seen.add(view);
+            for (const node of view.nodes) {
+                if (!node) continue;
+                if (node.renderElement === gridElement) {
+                    const tickets = node.componentView?.component?.dataSource?.data;
+                    if (!Array.isArray(tickets)) {
+                        throw new Error('O componente da tabela não expõe a lista de chamados esperada.');
+                    }
+                    const ids = new Map();
+                    for (const ticket of tickets) {
+                        if (!ticket ||
+                            !Number.isSafeInteger(ticket.TicketExternalId) || ticket.TicketExternalId <= 0 ||
+                            !Number.isSafeInteger(ticket.TicketId) || ticket.TicketId <= 0) {
+                            throw new TypeError('A tabela contém um identificador de chamado inválido.');
+                        }
+                        ids.set(String(ticket.TicketExternalId), ticket.TicketId);
+                    }
+                    return ids;
+                }
+                if (node.componentView) views.push(node.componentView);
+                views.push(...(node.viewContainer?._embeddedViews ?? []));
+            }
+        }
+        throw new Error('Não foi possível localizar os dados da tabela na aplicação Angular.');
+    }
+
+    /*
+     * ============================================================
      * Preferências
      * ============================================================
      */
@@ -61,7 +147,8 @@
         'startDate',
         'updateDate',
         'endDateEstimate',
-        'ticketAssignee'
+        'ticketAssignee',
+        TICKET_URL_COLUMN
     ];
 
     function loadPreferences() {
@@ -141,6 +228,15 @@
                 ...DEFAULT_EXPORT_COLUMNS
             ];
 
+            changed = true;
+        }
+
+        // Acrescenta URL uma vez às preferências existentes; depois respeita a seleção salva.
+        if (preferences.ticketUrlInitialized !== true) {
+            if (!preferences.exportColumns.includes(TICKET_URL_COLUMN)) {
+                preferences.exportColumns.push(TICKET_URL_COLUMN);
+            }
+            preferences.ticketUrlInitialized = true;
             changed = true;
         }
 
@@ -279,7 +375,7 @@
             .filter(Boolean);
     }
 
-    function getAvailableColumns(table) {
+    function getAvailableExportColumns(table) {
         const headerRow =
             table.tHead?.rows?.[0];
 
@@ -287,7 +383,7 @@
             return [];
         }
 
-        return [...headerRow.cells]
+        const columns = [...headerRow.cells]
             .map(cell => {
                 const id =
                     getColumnId(cell);
@@ -303,6 +399,9 @@
                 };
             })
             .filter(Boolean);
+
+        columns.push({ id: TICKET_URL_COLUMN, label: 'URL' });
+        return columns;
     }
 
     function moveColumnAfterInOrder(
@@ -993,7 +1092,7 @@
 			?.remove();
 
 		const availableColumns =
-			getAvailableColumns(table);
+			getAvailableExportColumns(table);
 
 		if (!availableColumns.length) {
 			return;
@@ -1573,8 +1672,27 @@
      * ============================================================
      */
 
+    function getTicketUrl(row, ticketIdsByExternalId) {
+        const externalIdCell = [...row.cells].find(cell =>
+            getColumnId(cell) === 'ticketExternalId'
+        );
+        if (!externalIdCell) {
+            throw new Error('A linha não contém a coluna com o número do chamado.');
+        }
+
+        const externalId = externalIdCell.innerText.trim();
+        const ticketId = ticketIdsByExternalId.get(externalId);
+        if (ticketId === undefined) {
+            throw new Error(
+                `Não foi possível associar o chamado ${externalId} aos dados atuais da tabela.`
+            );
+        }
+        return `${location.origin}/#/ticket/${ticketId}`;
+    }
+
     function buildMarkdownTable(
-        table
+        table,
+        ticketIdsByExternalId
     ) {
         const preferences =
             loadPreferences();
@@ -1629,6 +1747,7 @@
         const availableExportColumns =
             exportColumns.filter(
                 columnId =>
+                    columnId === TICKET_URL_COLUMN ||
                     getCell(
                         headerRow,
                         columnId
@@ -1682,7 +1801,7 @@
         const matrix = [
             availableExportColumns.map(
                 columnId =>
-                    getValue(
+                    columnId === TICKET_URL_COLUMN ? 'URL' : getValue(
                         getCell(
                             headerRow,
                             columnId
@@ -1695,7 +1814,7 @@
                 row =>
                     availableExportColumns.map(
                         columnId =>
-                            getValue(
+                            columnId === TICKET_URL_COLUMN ? getTicketUrl(row, ticketIdsByExternalId) : getValue(
                                 getCell(
                                     row,
                                     columnId
@@ -1800,42 +1919,51 @@
         button.type =
             'button';
 
-        button.textContent =
-            '⧉ Copiar tabela Markdown';
+        const copyLabel = '⧉ Copiar tabela Markdown';
+        let feedbackTimer = null;
+        button.textContent = copyLabel;
+
+        // Inicie a captura quando a tabela já existe e o Angular está disponível.
+        // O botão pode aguardar a mesma Promise se for acionado antes do próximo tick.
+        getAngularApplication().catch(error => {
+            console.error('LiveOps Enhancer: falha ao acessar a aplicação Angular.', error);
+        });
 
         button.addEventListener(
             'click',
             async () => {
-                const text =
-                    buildMarkdownTable(
-                        table
-                    );
-
-                if (!text) {
-                    return;
-                }
-
+                clearTimeout(feedbackTimer);
+                let copied = false;
+                button.disabled = true;
+                button.textContent = 'Copiando…';
                 try {
-                    await navigator
-                        .clipboard
-                        .writeText(text);
-                } catch {
-                    return;
+                    let ticketIds = null;
+                    if (loadPreferences().exportColumns.includes(TICKET_URL_COLUMN)) {
+                        const application = await getAngularApplication();
+                        ticketIds = getTicketIdsForGrid(
+                            table.closest('app-ticket-list-v2-grid'),
+                            application._views
+                        );
+                    }
+                    const text = buildMarkdownTable(table, ticketIds);
+                    if (!text) return;
+
+                    await navigator.clipboard.writeText(text);
+                    copied = true;
+                    button.textContent = '✓ Copiado';
+                } catch (error) {
+                    console.error('LiveOps Enhancer: falha na exportação.', error);
+                    window.alert(error.message);
+                } finally {
+                    button.disabled = false;
+                    if (copied) {
+                        feedbackTimer = setTimeout(() => {
+                            button.textContent = copyLabel;
+                        }, 1200);
+                    } else {
+                        button.textContent = copyLabel;
+                    }
                 }
-
-                const originalText =
-                    button.textContent;
-
-                button.textContent =
-                    '✓ Copiado';
-
-                setTimeout(
-                    () => {
-                        button.textContent =
-                            originalText;
-                    },
-                    1200
-                );
             }
         );
 
@@ -2606,7 +2734,7 @@
         );
 
     observer.observe(
-        document.documentElement,
+        document,
         {
             childList: true,
             subtree: true

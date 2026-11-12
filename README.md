@@ -6,6 +6,8 @@ Adiciona melhor navegação da tabela, rolagem horizontal, ordenação crescente
 
 O objetivo é tornar a consulta e o acompanhamento diário de chamados mais práticos, sem alterar o funcionamento do sistema original.
 
+A exportação Markdown inclui a coluna **URL** de cada chamado. Em **Configurar cópia**, é possível escolher as colunas e sua ordem.
+
 ## Instalação
 
 1. Instale o [Tampermonkey](https://www.tampermonkey.net/).
